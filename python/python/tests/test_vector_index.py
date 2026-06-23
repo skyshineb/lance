@@ -1818,6 +1818,7 @@ def test_no_stale_duplicate_after_partial_column_update(tmp_path):
         f"updated row id=10000 returned {len(dupes)} times "
         f"(stale index segment not masked); rowids={res['_rowid'].tolist()}"
     )
+    assert dupes["_rowid"].iloc[0] == rowids[0]
 
 
 @pytest.mark.skip(reason="retrain is deprecated")
