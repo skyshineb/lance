@@ -127,13 +127,27 @@ impl DatasetPreFilter {
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn do_create_deletion_mask_row_id(dataset: Arc<Dataset>) -> Result<Arc<RowAddrMask>> {
-        // This can only be computed as an allow list, since we have no idea
-        // what the row ids were in the missing fragments.
+    async fn do_create_deletion_mask_row_id(
+        dataset: Arc<Dataset>,
+        restrict_to: Option<RoaringBitmap>,
+    ) -> Result<Arc<RowAddrMask>> {
+        // This can only be computed as an allow list. When `restrict_to` is set,
+        // only include stable row ids whose current physical home is in the
+        // restricted fragment set.
         async fn load_row_ids_and_deletions(
             dataset: &Dataset,
+            restrict_to: Option<&RoaringBitmap>,
         ) -> Result<Vec<(Arc<RowIdSequence>, Option<Arc<DeletionVector>>)>> {
-            stream::iter(dataset.get_fragments())
+            let frags: Vec<_> = dataset
+                .get_fragments()
+                .into_iter()
+                .filter(|frag| {
+                    restrict_to
+                        .map(|allow| allow.contains(frag.id() as u32))
+                        .unwrap_or(true)
+                })
+                .collect();
+            stream::iter(frags)
                 .map(|frag| async move {
                     let row_ids = load_row_id_sequence(dataset, frag.metadata());
                     let deletion_vector = frag.get_deletion_vector();
@@ -145,16 +159,30 @@ impl DatasetPreFilter {
                 .await
         }
 
+        let restrict_hash = restrict_to.as_ref().map(|bitmap| {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            for value in bitmap.iter() {
+                value.hash(&mut hasher);
+            }
+            hasher.finish()
+        });
+
         let dataset_clone = dataset.clone();
+        let restrict_for_load = restrict_to.clone();
         let key = crate::session::caches::RowAddrMaskKey {
             version: dataset.manifest().version,
+            restrict_hash,
         };
         dataset
             .metadata_cache
             .as_ref()
             .get_or_insert_with_key(key, move || {
                 async move {
-                    let row_ids_and_deletions = load_row_ids_and_deletions(&dataset_clone).await?;
+                    let row_ids_and_deletions =
+                        load_row_ids_and_deletions(&dataset_clone, restrict_for_load.as_ref())
+                            .await?;
 
                     // The process of computing the final mask is CPU-bound, so we spawn it
                     // on a blocking thread.
@@ -268,7 +296,12 @@ impl DatasetPreFilter {
         if missing_frags.is_empty() && frags_with_deletion_files.is_empty() && !needs_allow_list {
             None
         } else if dataset.manifest.uses_stable_row_ids() {
-            Some(Self::do_create_deletion_mask_row_id(dataset.clone()).boxed())
+            let restrict_to = if restrict_to_fragments {
+                Some(fragments)
+            } else {
+                None
+            };
+            Some(Self::do_create_deletion_mask_row_id(dataset.clone(), restrict_to).boxed())
         } else if missing_frags.is_empty() && frags_with_deletion_files.is_empty() {
             // No deletions to load, but the dataset has fragments outside the
             // index bitmap. Return a synchronous allow-list mask.
@@ -528,5 +561,37 @@ mod test {
         assert!(mask.is_some());
         let mask = mask.unwrap().await.unwrap();
         assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(3)); // There were three rows left over;
+    }
+
+    #[tokio::test]
+    async fn test_restricted_deletion_mask_stable_row_id_honors_bitmap() {
+        let datasets = test_datasets(true).await;
+        let ds = datasets.deletions_no_missing_frags.clone();
+
+        let mask = DatasetPreFilter::create_restricted_deletion_mask(
+            ds.clone(),
+            RoaringBitmap::from_iter(0..3),
+        )
+        .expect("full-bitmap mask present on stable-row-id dataset with deletions")
+        .await
+        .unwrap();
+        let expected_all = RowAddrTreeMap::from_iter(0..8);
+        assert_eq!(mask.allow_list(), Some(&expected_all));
+
+        let mask = DatasetPreFilter::create_restricted_deletion_mask(
+            ds.clone(),
+            RoaringBitmap::from_iter(0..2),
+        )
+        .expect("restricted mask present")
+        .await
+        .unwrap();
+        let expected_restricted = RowAddrTreeMap::from_iter(0..6);
+        assert_eq!(mask.allow_list(), Some(&expected_restricted));
+
+        let mask = DatasetPreFilter::create_restricted_deletion_mask(ds, RoaringBitmap::new())
+            .expect("empty-restriction mask present")
+            .await
+            .unwrap();
+        assert_eq!(mask.allow_list().and_then(|x| x.len()), Some(0));
     }
 }
