@@ -286,7 +286,7 @@ pub fn field_path_to_expr(field_path: &str) -> Result<Expr> {
     }
 
     // Build the column expression, handling nested fields
-    let mut expr = col(&parts[0]);
+    let mut expr = Expr::Column(datafusion::common::Column::from_name(parts[0].clone()));
     for part in &parts[1..] {
         expr = expr.field_newstyle(part);
     }
@@ -302,6 +302,27 @@ mod tests {
 
     use arrow_schema::{Field, Schema as ArrowSchema};
     use datafusion_functions::core::expr_ext::FieldAccessor;
+
+    #[test]
+    fn test_field_path_to_expr_preserves_root_field_name() {
+        let expr = field_path_to_expr("VECTOR").unwrap();
+        match expr {
+            Expr::Column(column) => {
+                assert!(column.relation.is_none());
+                assert_eq!(column.name, "VECTOR");
+            }
+            _ => panic!("Expected Column"),
+        }
+
+        let expr = field_path_to_expr("`Vector.Name`").unwrap();
+        match expr {
+            Expr::Column(column) => {
+                assert!(column.relation.is_none());
+                assert_eq!(column.name, "Vector.Name");
+            }
+            _ => panic!("Expected Column"),
+        }
+    }
 
     #[test]
     fn test_resolve_large_utf8() {

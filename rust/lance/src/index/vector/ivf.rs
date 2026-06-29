@@ -2731,6 +2731,29 @@ mod tests {
     use crate::utils::test::copy_test_data_to_tmp;
 
     const DIM: usize = 32;
+    const UPPERCASE_VECTOR_COLUMN: &str = "VECTOR";
+    const UPPERCASE_VECTOR_DIM: usize = 16;
+
+    fn uppercase_vector_value(row: usize, dimension: usize) -> f32 {
+        let base = ((row * 31 + dimension * 17) % 1024) as f32 / 1024.0;
+        base + row as f32 * 0.000_01
+    }
+
+    fn uppercase_vector_batch(
+        schema: Arc<Schema>,
+        start_row: usize,
+        num_rows: usize,
+    ) -> RecordBatch {
+        let values = (start_row..start_row + num_rows)
+            .flat_map(|row| {
+                (0..UPPERCASE_VECTOR_DIM)
+                    .map(move |dimension| uppercase_vector_value(row, dimension))
+            })
+            .collect::<Float32Array>();
+        let vectors =
+            FixedSizeListArray::try_new_from_values(values, UPPERCASE_VECTOR_DIM as i32).unwrap();
+        RecordBatch::try_new(schema, vec![Arc::new(vectors)]).unwrap()
+    }
 
     // Verifies LANCE_INCLUDE_VECTOR_CENTROIDS env var is honored by
     // maybe_centroids_for_stats. The env var is process-global, so this test
@@ -3567,6 +3590,69 @@ mod tests {
         // Optimize the index
         dataset.optimize_indices(&Default::default()).await.unwrap();
         check_index(&dataset, num_non_null, dims).await;
+    }
+
+    #[tokio::test]
+    async fn test_optimize_ivf_pq_preserves_case_sensitive_nullable_vector_column() {
+        const INDEX_NAME: &str = "uppercase_vector_idx";
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            UPPERCASE_VECTOR_COLUMN,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                UPPERCASE_VECTOR_DIM as i32,
+            ),
+            true,
+        )]));
+
+        let batch = uppercase_vector_batch(schema.clone(), 0, 512);
+        let batches = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+        let mut dataset = Dataset::write(batches, test_uri, None).await.unwrap();
+
+        let params = VectorIndexParams::ivf_pq(2, 8, 2, MetricType::L2, 2);
+        dataset
+            .create_index(
+                &[UPPERCASE_VECTOR_COLUMN],
+                IndexType::Vector,
+                Some(INDEX_NAME.into()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let append_batch = uppercase_vector_batch(schema, 512, 128);
+        let mut dataset = InsertBuilder::new(Arc::new(dataset))
+            .with_params(&WriteParams {
+                mode: WriteMode::Append,
+                ..Default::default()
+            })
+            .execute(vec![append_batch])
+            .await
+            .unwrap();
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        assert!(!indices.is_empty(), "expected optimized index to exist");
+
+        let query = (0..UPPERCASE_VECTOR_DIM)
+            .map(|dimension| uppercase_vector_value(0, dimension))
+            .collect::<Float32Array>();
+        let results = dataset
+            .scan()
+            .nearest(UPPERCASE_VECTOR_COLUMN, &query, 4)
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(results.num_rows(), 4);
     }
 
     #[tokio::test]
